@@ -1,72 +1,128 @@
-FROM ubuntu:16.04
-# forked from Ben, 2017
-#MAINTAINER Ben Leong <cleong@ets.org>
-MAINTAINER Gary Feng <gary.feng@gmail.com>
+# Dockerfile to build OpenFace 2.20
+#   Dockerfile modified from that in the 2.20 release, with direct installation.
 
-RUN apt-get update && \
-	apt-get install -y \
-	build-essential \
-	checkinstall \
-	clang-3.7 \
-	clang++-3.7 \
-	cmake \
-	git \
-	libavcodec-dev \
-	libavformat-dev \
-	libboost-all-dev \
-	libc++abi-dev \
-	libc++-dev \
-	libdc1394-22-dev \
-	libgtk2.0-dev \
-	libjasper-dev \
-	libjpeg-dev \
-	liblapack-dev \
-	libopenblas-dev \
-	libpng-dev \
-	libswscale-dev \
-	libtbb2 \
-	libtbb-dev \
-	libtiff-dev \
-	llvm \
-	pkg-config \
-	python-dev \
-	python-numpy \
-	sshfs \
-	unzip \
-	wget
+# ==================== Building Model Layer ===========================
+# This is a little trick to improve caching and minimize rebuild time
+# and bandwidth. Note that RUN commands only cache-miss if the prior layers
+# miss, or the dockerfile changes prior to this step.
+# To update these patch files, be sure to run build with --no-cache
+FROM alpine as model_data
+RUN apk --no-cache --update-cache add wget
+WORKDIR /data/patch_experts
 
-RUN wget https://github.com/Itseez/opencv/archive/3.1.0.zip && \
-	unzip 3.1.0.zip -d /opt && \
-	cd /opt/opencv-3.1.0 && \
-	mkdir build && \
-	cd build && \
-	cmake -D CMAKE_BUILD_TYPE=RELEASE \
-	-D CMAKE_INSTALL_PREFIX=/usr/local \
-	-D WITH_TBB=ON -D BUILD_SHARED_LIBS=OFF .. && \
-	make -j2 && \
-	make install
+RUN wget -q https://www.dropbox.com/s/7na5qsjzz8yfoer/cen_patches_0.25_of.dat &&\
+    wget -q https://www.dropbox.com/s/k7bj804cyiu474t/cen_patches_0.35_of.dat &&\
+    wget -q https://www.dropbox.com/s/ixt4vkbmxgab1iu/cen_patches_0.50_of.dat &&\
+    wget -q https://www.dropbox.com/s/2t5t1sdpshzfhpj/cen_patches_1.00_of.dat
 
-# successfully built using commit SHA cdd258330f2d3f121005ab3ed0233c9442402afb
-RUN cd /opt && \
-	git clone https://github.com/TadasBaltrusaitis/OpenFace.git && \
-	cd OpenFace && \
-	git reset --hard cdd258330f2d3f121005ab3ed0233c9442402afb && \
-	mkdir build && \
-	cd build && \
-	cmake -D CMAKE_BUILD_TYPE=RELEASE .. && \
-	make
+## ==================== Install Ubuntu Base libs ===========================
+## This will be our base image for OpenFace, and also the base for the compiler
+## image. We only need packages which are linked
 
-# install editors
-RUN apt-get install -y \
-	emacs \
-	vim
+FROM ubuntu:18.04 as ubuntu_base
 
-# clean up
-RUN rm 3.1.0.zip
+LABEL maintainer="Michael McDermott <mikemcdermott23@gmail.com>"
 
-# set working directory
-WORKDIR /opt/OpenFace/build/bin
+ARG DEBIAN_FRONTEND=noninteractive
 
-# internal use only
-# copy feature extraction script over
-# COPY ./start_feature_extraction.sh /opt/OpenFace/build/bin
+# todo: minimize this even more
+RUN apt-get update -qq &&\
+    apt-get install -qq curl &&\
+    apt-get install -qq --no-install-recommends \
+        libopenblas-dev liblapack-dev \
+        libavcodec-dev libavformat-dev libswscale-dev \
+        libtbb2 libtbb-dev libjpeg-dev \
+        libpng-dev libtiff-dev &&\
+    rm -rf /var/lib/apt/lists/*
+
+## ==================== Build-time dependency libs ======================
+## This will build and install opencv and dlib into an additional dummy
+## directory, /root/diff, so we can later copy in these artifacts,
+## minimizing docker layer size
+## Protip: ninja is faster than `make -j` and less likely to lock up system
+FROM ubuntu_base as cv_deps
+
+WORKDIR /root/build-dep
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -qq -y \
+        cmake ninja-build pkg-config build-essential checkinstall\
+        g++-8 &&\
+    rm -rf /var/lib/apt/lists/* &&\
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 --slave /usr/bin/g++ g++ /usr/bin/g++-8
+
+##        llvm clang-3.7 libc++-dev libc++abi-dev  \
+## ==================== Building dlib ===========================
+
+RUN curl http://dlib.net/files/dlib-19.13.tar.bz2 -LO &&\
+    tar xf dlib-19.13.tar.bz2 && \
+    rm dlib-19.13.tar.bz2 &&\
+    mv dlib-19.13 dlib &&\
+    mkdir -p dlib/build &&\
+    cd dlib/build &&\
+    cmake -DCMAKE_BUILD_TYPE=Release -G Ninja .. &&\
+    ninja && \
+    ninja install && \
+    DESTDIR=/root/diff ninja install &&\
+    ldconfig
+
+## ==================== Building OpenCV ======================
+ENV OPENCV_VERSION=4.1.0
+
+RUN curl https://github.com/opencv/opencv/archive/${OPENCV_VERSION}.tar.gz -LO &&\
+    tar xf ${OPENCV_VERSION}.tar.gz && \
+    rm ${OPENCV_VERSION}.tar.gz &&\
+    mv opencv-${OPENCV_VERSION} opencv && \
+    mkdir -p opencv/build && \
+    cd opencv/build && \
+    cmake -D CMAKE_BUILD_TYPE=RELEASE \
+        -D CMAKE_INSTALL_PREFIX=/usr/local \
+        -D WITH_TBB=ON -D WITH_CUDA=OFF \
+        -DWITH_QT=OFF -DWITH_GTK=OFF\
+        -G Ninja .. && \
+    ninja && \
+    ninja install &&\
+    DESTDIR=/root/diff ninja install
+
+## ==================== Building OpenFace ===========================
+FROM cv_deps as openface_download
+WORKDIR /root/openface
+
+ENV OPENFACE_VERSION=2.2.0
+
+RUN curl https://github.com/TadasBaltrusaitis/OpenFace/archive/OpenFace_${OPENFACE_VERSION}.tar.gz -LO &&\
+    tar xf OpenFace_${OPENFACE_VERSION}.tar.gz && \
+    rm OpenFace_${OPENFACE_VERSION}.tar.gz 
+
+# RUN cp -R /root/openface/OpenFace-OpenFace_${OPENFACE_VERSION}/\*.\* /root/openface 
+
+## ==================== Building OpenFace ===========================
+FROM openface_download as openface
+WORKDIR /root/openface
+
+# COPY ./ ./
+# RUN cp -R /root/openface/OpenFace-OpenFace_${OPENFACE_VERSION}/\*.\* /root/openface
+
+COPY --from=model_data /data/patch_experts/* \
+    /root/openface/OpenFace-OpenFace_${OPENFACE_VERSION}/lib/local/LandmarkDetector/model/patch_experts/
+
+RUN cd OpenFace-OpenFace_${OPENFACE_VERSION} && \
+    mkdir -p build && cd build && \
+    cmake -D CMAKE_BUILD_TYPE=RELEASE -G Ninja .. && \
+    ninja &&\
+    DESTDIR=/root/diff ninja install
+
+
+## ==================== Streamline container ===========================
+## Clean up - start fresh and only copy in necessary stuff
+## This shrinks the image from ~8 GB to ~1.6 GB
+FROM ubuntu_base as final
+LABEL maintainer="Gary Feng <gary.feng@gmail.com>"
+
+WORKDIR /root
+
+# Copy in only necessary libraries
+COPY --from=openface /root/diff /
+
+# Since we "imported" the build artifacts, we need to reconfigure ld
+RUN ldconfig
